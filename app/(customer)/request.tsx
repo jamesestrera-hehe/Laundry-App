@@ -1,21 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import { router } from 'expo-router';
+import { addDoc, collection, doc, getDoc, getDocs, query, where } from 'firebase/firestore';
+import React, { useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
+  ActivityIndicator,
+  Alert,
+  Image,
+  Modal,
   ScrollView,
+  StyleSheet,
+  Text,
   TextInput,
   TouchableOpacity,
-  Alert,
-  ActivityIndicator,
-  Modal,
+  View,
 } from 'react-native';
-import { COLORS, SIZES } from '../constants/theme';
-import { db } from '../firebase';
-import { useAuth } from '../context/AuthContext';
-import { collection, addDoc, getDocs, query, where } from 'firebase/firestore';
 import AppButton from '../components/Appbutton';
-import { router } from 'expo-router';
+import { COLORS } from '../constants/theme';
+import { useAuth } from '../context/AuthContext';
+import { db } from '../firebase';
 
 interface Service {
   id: string;
@@ -26,6 +27,23 @@ interface Service {
   category: string;
   active: boolean;
 }
+
+interface Coupon {
+  code: string;
+  discountPercentage: number;
+  milestoneLevel: number;
+}
+
+// Pre-defined coupon codes for each milestone
+const MILESTONE_COUPONS: { [key: string]: Coupon } = {
+  "LAUND5": { code: "LAUND5", discountPercentage: 5, milestoneLevel: 1 },
+  "LAUND8": { code: "LAUND8", discountPercentage: 8, milestoneLevel: 2 },
+  "LAUND10": { code: "LAUND10", discountPercentage: 10, milestoneLevel: 3 },
+  "LAUND12": { code: "LAUND12", discountPercentage: 12, milestoneLevel: 4 },
+  "LAUND15": { code: "LAUND15", discountPercentage: 15, milestoneLevel: 5 },
+  "LAUND18": { code: "LAUND18", discountPercentage: 18, milestoneLevel: 6 },
+  "LAUND20": { code: "LAUND20", discountPercentage: 20, milestoneLevel: 7 },
+};
 
 const RequestScreen = () => {
   const { user } = useAuth();
@@ -41,6 +59,11 @@ const RequestScreen = () => {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [selectedPayment, setSelectedPayment] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date());
+  const [couponCode, setCouponCode] = useState('');
+  const [appliedCoupon, setAppliedCoupon] = useState<Coupon | null>(null);
+  const [couponError, setCouponError] = useState('');
+  const [applyingCoupon, setApplyingCoupon] = useState(false);
+  const [showQRModal, setShowQRModal] = useState(false);
 
   // Generate next 7 days for calendar
   const getNext7Days = () => {
@@ -116,10 +139,123 @@ const RequestScreen = () => {
     return selectedService.pricePerKg * weightNum;
   };
 
+  const calculateDiscount = () => {
+    const subtotal = calculateSubtotal();
+    if (!appliedCoupon) return 0;
+    return subtotal * (appliedCoupon.discountPercentage / 100);
+  };
+
+  const calculateDeliveryFee = () => {
+    const subtotal = calculateSubtotal();
+    return subtotal > 0 ? 50 : 0;
+  };
+
   const calculateTotal = () => {
     const subtotal = calculateSubtotal();
-    const deliveryFee = subtotal > 0 ? 50 : 0;
-    return subtotal + deliveryFee;
+    const deliveryFee = calculateDeliveryFee();
+    const discount = calculateDiscount();
+    return subtotal + deliveryFee - discount;
+  };
+
+  const validateCoupon = async (code: string) => {
+    if (!user?.uid) {
+      setCouponError('Please login to use coupons');
+      return false;
+    }
+
+    const coupon = MILESTONE_COUPONS[code.toUpperCase()];
+    if (!coupon) {
+      setCouponError('Invalid coupon code');
+      return false;
+    }
+
+    // Check if user has earned this coupon
+    try {
+      const loyaltyRef = doc(db, 'userLoyalty', user.uid);
+      const loyaltyDoc = await getDoc(loyaltyRef);
+      
+      if (!loyaltyDoc.exists()) {
+        setCouponError("You haven't earned this coupon yet");
+        return false;
+      }
+
+      const userLoyalty = loyaltyDoc.data();
+      const milestonesReached = userLoyalty.milestonesReached || [];
+      
+      // Check if user reached the required milestone
+      const hasMilestone = milestonesReached.some(
+        (m: any) => m.level === coupon.milestoneLevel
+      );
+      
+      if (!hasMilestone) {
+        const ordersRequired = coupon.milestoneLevel === 1 ? 25 : coupon.milestoneLevel * 25;
+        setCouponError(`Complete ${ordersRequired} orders to unlock this coupon`);
+        return false;
+      }
+
+      // Check if coupon has already been used
+      const usedCouponsQuery = query(
+        collection(db, 'usedCoupons'),
+        where('userId', '==', user.uid),
+        where('couponCode', '==', code.toUpperCase())
+      );
+      const usedCouponsSnapshot = await getDocs(usedCouponsQuery);
+      
+      if (!usedCouponsSnapshot.empty) {
+        setCouponError('You have already used this coupon');
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Error validating coupon:', error);
+      setCouponError('Error validating coupon');
+      return false;
+    }
+  };
+
+  const handleApplyCoupon = async () => {
+    if (!couponCode.trim()) {
+      setCouponError('Please enter a coupon code');
+      return;
+    }
+
+    setApplyingCoupon(true);
+    setCouponError('');
+    
+    const isValid = await validateCoupon(couponCode);
+    
+    if (isValid) {
+      const coupon = MILESTONE_COUPONS[couponCode.toUpperCase()];
+      setAppliedCoupon(coupon);
+      Alert.alert('Success', `${coupon.discountPercentage}% discount applied!`);
+      setCouponCode('');
+    }
+    
+    setApplyingCoupon(false);
+  };
+
+  const handleRemoveCoupon = () => {
+    setAppliedCoupon(null);
+    setCouponError('');
+  };
+
+  const markCouponAsUsed = async (orderId: string) => {
+    if (!appliedCoupon || !user?.uid) return;
+    
+    try {
+      await addDoc(collection(db, 'usedCoupons'), {
+        userId: user.uid,
+        couponCode: appliedCoupon.code,
+        milestoneLevel: appliedCoupon.milestoneLevel,
+        usedAt: new Date().toISOString(),
+        orderId: orderId,
+        discountAmount: calculateDiscount(),
+        originalTotal: calculateSubtotal() + calculateDeliveryFee(),
+      });
+    } catch (error) {
+      console.error('Error marking coupon as used:', error);
+    }
   };
 
   const validateForm = () => {
@@ -158,6 +294,16 @@ const RequestScreen = () => {
     }
   };
 
+  const handlePaymentSelection = (method: string) => {
+    setSelectedPayment(method);
+    if (method === 'GCash') {
+      setShowQRModal(true);
+    } else {
+      setShowPaymentModal(false);
+      handleSubmitOrder();
+    }
+  };
+
   const handleSubmitOrder = async () => {
     if (!selectedPayment) {
       Alert.alert('Error', 'Please select payment method');
@@ -168,6 +314,8 @@ const RequestScreen = () => {
     try {
       const weightNum = parseFloat(weight);
       const subtotal = calculateSubtotal();
+      const deliveryFee = calculateDeliveryFee();
+      const discount = calculateDiscount();
       const total = calculateTotal();
 
       const orderData = {
@@ -178,23 +326,41 @@ const RequestScreen = () => {
         pricePerKg: selectedService!.pricePerKg,
         weight: weightNum,
         subtotal: subtotal,
-        deliveryFee: 50,
+        deliveryFee: deliveryFee,
+        discount: discount,
+        discountPercentage: appliedCoupon?.discountPercentage || 0,
+        couponCode: appliedCoupon?.code || null,
         total: total,
         address: address.trim(),
         pickupDate: pickupDate,
         notes: notes.trim(),
         paymentMethod: selectedPayment,
-        paymentStatus: 'pending',
+        paymentStatus: selectedPayment === 'GCash' ? 'pending_qr' : 'pending',
         status: 'pending',
         createdAt: new Date().toISOString(),
       };
 
-      await addDoc(collection(db, 'orders'), orderData);
+      const docRef = await addDoc(collection(db, 'orders'), orderData);
+      
+      // Mark coupon as used if applied
+      if (appliedCoupon) {
+        await markCouponAsUsed(docRef.id);
+      }
       
       setShowPaymentModal(false);
+      setShowQRModal(false);
+      
+      const discountMessage = appliedCoupon 
+        ? `\n\nDiscount Applied: ${appliedCoupon.discountPercentage}% OFF\nYou saved: ₱${discount.toFixed(2)}`
+        : '';
+      
+      const paymentMessage = selectedPayment === 'GCash' 
+        ? '\n\n📱 Please complete the payment via GCash using the QR code shown.'
+        : '';
+      
       Alert.alert(
         'Order Placed!',
-        `Your order has been placed successfully!\n\nPayment Method: ${selectedPayment}\nTotal: ₱${total.toFixed(2)}\n\nYou can pay upon pickup.`,
+        `Your order has been placed successfully!\n\nPayment Method: ${selectedPayment}\nOriginal Total: ₱{(subtotal + deliveryFee).toFixed(2)}\nFinal Total: ₱${total.toFixed(2)}${discountMessage}${paymentMessage}\n\nYou can pay upon pickup.`,
         [{ text: 'OK', onPress: () => router.push('/(customer)') }]
       );
       
@@ -205,6 +371,8 @@ const RequestScreen = () => {
       setNotes('');
       setSelectedPayment('');
       setSelectedDate(new Date());
+      setAppliedCoupon(null);
+      setCouponCode('');
     } catch (error) {
       Alert.alert('Error', 'Failed to place order. Please try again.');
     } finally {
@@ -215,6 +383,80 @@ const RequestScreen = () => {
   const formatPrice = (price: number) => {
     return `₱${price}/kg`;
   };
+
+  const QRModal = () => (
+    <Modal
+      visible={showQRModal}
+      transparent={true}
+      animationType="slide"
+      onRequestClose={() => {
+        setShowQRModal(false);
+        setSelectedPayment('');
+      }}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.qrModalContent}>
+          <Text style={styles.qrModalTitle}>📱 GCash Payment</Text>
+          
+          <View style={styles.qrContainer}>
+            <Image 
+              source={require('../../assets/qr.jpg')}
+              style={styles.qrImage}
+              resizeMode="contain"
+            />
+          </View>
+          
+          <View style={styles.qrInstructions}>
+            <Text style={styles.qrInstructionTitle}>How to pay:</Text>
+            <View style={styles.instructionItem}>
+              <Text style={styles.instructionBullet}>1.</Text>
+              <Text style={styles.instructionText}>Open GCash app on your phone</Text>
+            </View>
+            <View style={styles.instructionItem}>
+              <Text style={styles.instructionBullet}>2.</Text>
+              <Text style={styles.instructionText}>Tap "Scan QR Code"</Text>
+            </View>
+            <View style={styles.instructionItem}>
+              <Text style={styles.instructionBullet}>3.</Text>
+              <Text style={styles.instructionText}>Scan the QR code above</Text>
+            </View>
+            <View style={styles.instructionItem}>
+              <Text style={styles.instructionBullet}>4.</Text>
+              <Text style={styles.instructionText}>Enter the exact amount: ₱{calculateTotal().toFixed(2)}</Text>
+            </View>
+            <View style={styles.instructionItem}>
+              <Text style={styles.instructionBullet}>5.</Text>
+              <Text style={styles.instructionText}>Complete the payment</Text>
+            </View>
+          </View>
+          
+          <View style={styles.saveQRContainer}>
+            <Text style={styles.saveQRText}>💡 Save this QR code for future reference</Text>
+          </View>
+          
+          <TouchableOpacity 
+            style={styles.qrConfirmButton}
+            onPress={() => {
+              setShowQRModal(false);
+              handleSubmitOrder();
+            }}
+          >
+            <Text style={styles.qrConfirmButtonText}>I have saved the QR code</Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={styles.qrCancelButton}
+            onPress={() => {
+              setShowQRModal(false);
+              setSelectedPayment('');
+            }}
+          >
+            <Text style={styles.qrCancelButtonText}>Back</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
 
   if (loading) {
     return (
@@ -323,6 +565,64 @@ const RequestScreen = () => {
         />
       </View>
 
+      {/* Coupon Section - Nicer Design */}
+      <View style={styles.section}>
+        <Text style={styles.label}>🎫 Coupon Code</Text>
+        {!appliedCoupon ? (
+          <View>
+            <View style={styles.couponWrapper}>
+              <View style={styles.couponInputWrapper}>
+                <Text style={styles.couponIcon}>🏷️</Text>
+                <TextInput
+                  style={styles.couponInput}
+                  placeholder="Enter coupon code"
+                  value={couponCode}
+                  onChangeText={(text) => {
+                    setCouponCode(text.toUpperCase());
+                    setCouponError('');
+                  }}
+                  placeholderTextColor={COLORS.gray}
+                  autoCapitalize="characters"
+                />
+              </View>
+              <TouchableOpacity 
+                style={styles.applyButton}
+                onPress={handleApplyCoupon}
+                disabled={applyingCoupon}
+              >
+                <Text style={styles.applyButtonText}>
+                  {applyingCoupon ? '...' : 'Apply'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+            {couponError ? (
+              <View style={styles.couponErrorContainer}>
+                <Text style={styles.couponErrorIcon}>⚠️</Text>
+                <Text style={styles.couponError}>{couponError}</Text>
+              </View>
+            ) : null}
+          </View>
+        ) : (
+          <View style={styles.appliedCouponCard}>
+            <View style={styles.appliedCouponIconContainer}>
+              <Text style={styles.appliedCouponIcon}>🎉</Text>
+            </View>
+            <View style={styles.appliedCouponInfo}>
+              <Text style={styles.appliedCouponCode}>{appliedCoupon.code}</Text>
+              <Text style={styles.appliedCouponDiscount}>
+                {appliedCoupon.discountPercentage}% OFF Applied
+              </Text>
+            </View>
+            <TouchableOpacity 
+              style={styles.removeCouponButton}
+              onPress={handleRemoveCoupon}
+            >
+              <Text style={styles.removeCouponText}>Remove</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+
       {/* Notes (Optional) */}
       <View style={styles.section}>
         <Text style={styles.label}>Notes <Text style={styles.optional}>(Optional)</Text></Text>
@@ -353,8 +653,19 @@ const RequestScreen = () => {
           
           <View style={styles.summaryRow}>
             <Text style={styles.summaryLabel}>Delivery Fee</Text>
-            <Text style={styles.summaryValue}>₱50.00</Text>
+            <Text style={styles.summaryValue}>₱{calculateDeliveryFee().toFixed(2)}</Text>
           </View>
+
+          {appliedCoupon && (
+            <View style={styles.summaryRow}>
+              <Text style={styles.summaryLabel}>
+                Discount ({appliedCoupon.discountPercentage}% OFF)
+              </Text>
+              <Text style={styles.discountValue}>
+                -₱{calculateDiscount().toFixed(2)}
+              </Text>
+            </View>
+          )}
           
           <View style={styles.divider} />
           
@@ -362,6 +673,12 @@ const RequestScreen = () => {
             <Text style={styles.totalLabel}>Total</Text>
             <Text style={styles.totalValue}>₱{calculateTotal().toFixed(2)}</Text>
           </View>
+
+          {appliedCoupon && (
+            <Text style={styles.savingsText}>
+              ✨ You saved ₱{calculateDiscount().toFixed(2)} with {appliedCoupon.code}
+            </Text>
+          )}
         </View>
       )}
 
@@ -424,7 +741,10 @@ const RequestScreen = () => {
         visible={showPaymentModal}
         transparent={true}
         animationType="slide"
-        onRequestClose={() => setShowPaymentModal(false)}
+        onRequestClose={() => {
+          setShowPaymentModal(false);
+          setSelectedPayment('');
+        }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.paymentModalContent}>
@@ -435,7 +755,7 @@ const RequestScreen = () => {
                 styles.paymentOption,
                 selectedPayment === 'Cash on Pickup' && styles.paymentOptionSelected
               ]}
-              onPress={() => setSelectedPayment('Cash on Pickup')}
+              onPress={() => handlePaymentSelection('Cash on Pickup')}
             >
               <Text style={styles.paymentIcon}>💵</Text>
               <View style={styles.paymentInfo}>
@@ -444,7 +764,7 @@ const RequestScreen = () => {
               </View>
               {selectedPayment === 'Cash on Pickup' && (
                 <View style={styles.radioSelected}>
-                  <Text style={styles.radioDot} />
+                  <View style={styles.radioDot} />
                 </View>
               )}
             </TouchableOpacity>
@@ -454,16 +774,16 @@ const RequestScreen = () => {
                 styles.paymentOption,
                 selectedPayment === 'GCash' && styles.paymentOptionSelected
               ]}
-              onPress={() => setSelectedPayment('GCash')}
+              onPress={() => handlePaymentSelection('GCash')}
             >
               <Text style={styles.paymentIcon}>📱</Text>
               <View style={styles.paymentInfo}>
                 <Text style={styles.paymentName}>GCash</Text>
-                <Text style={styles.paymentDesc}>Pay via GCash</Text>
+                <Text style={styles.paymentDesc}>Pay via GCash (QR code)</Text>
               </View>
               {selectedPayment === 'GCash' && (
                 <View style={styles.radioSelected}>
-                  <Text style={styles.radioDot} />
+                  <View style={styles.radioDot} />
                 </View>
               )}
             </TouchableOpacity>
@@ -473,7 +793,7 @@ const RequestScreen = () => {
                 styles.paymentOption,
                 selectedPayment === 'Bank Transfer' && styles.paymentOptionSelected
               ]}
-              onPress={() => setSelectedPayment('Bank Transfer')}
+              onPress={() => handlePaymentSelection('Bank Transfer')}
             >
               <Text style={styles.paymentIcon}>🏦</Text>
               <View style={styles.paymentInfo}>
@@ -482,7 +802,7 @@ const RequestScreen = () => {
               </View>
               {selectedPayment === 'Bank Transfer' && (
                 <View style={styles.radioSelected}>
-                  <Text style={styles.radioDot} />
+                  <View style={styles.radioDot} />
                 </View>
               )}
             </TouchableOpacity>
@@ -492,29 +812,28 @@ const RequestScreen = () => {
               <Text style={styles.paymentTotalValue}>₱{calculateTotal().toFixed(2)}</Text>
             </View>
 
-            <View style={styles.paymentButtons}>
-              <TouchableOpacity 
-                style={[styles.paymentButton, styles.cancelPaymentButton]}
-                onPress={() => {
-                  setShowPaymentModal(false);
-                  setSelectedPayment('');
-                }}
-              >
-                <Text style={styles.cancelPaymentText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.paymentButton, styles.confirmPaymentButton]}
-                onPress={handleSubmitOrder}
-                disabled={submitting}
-              >
-                <Text style={styles.confirmPaymentText}>
-                  {submitting ? 'Processing...' : 'Confirm Order'}
+            {appliedCoupon && (
+              <View style={styles.paymentSavings}>
+                <Text style={styles.paymentSavingsText}>
+                  ✨ {appliedCoupon.discountPercentage}% discount applied
                 </Text>
-              </TouchableOpacity>
-            </View>
+              </View>
+            )}
+
+            <TouchableOpacity 
+              style={styles.cancelPaymentButton}
+              onPress={() => {
+                setShowPaymentModal(false);
+                setSelectedPayment('');
+              }}
+            >
+              <Text style={styles.cancelPaymentText}>Cancel</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
+
+      <QRModal />
     </ScrollView>
   );
 };
@@ -704,6 +1023,107 @@ const styles = StyleSheet.create({
     height: 80,
     textAlignVertical: 'top',
   },
+  couponWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  couponInputWrapper: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e9ecef',
+    borderRadius: 12,
+    backgroundColor: COLORS.white || '#fff',
+    paddingHorizontal: 12,
+  },
+  couponIcon: {
+    fontSize: 18,
+    marginRight: 8,
+    color: COLORS.gray,
+  },
+  couponInput: {
+    flex: 1,
+    paddingVertical: 14,
+    paddingRight: 8,
+    fontSize: 16,
+    textTransform: 'uppercase',
+  },
+  applyButton: {
+    backgroundColor: COLORS.primary || '#007aff',
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    borderRadius: 12,
+  },
+  applyButtonText: {
+    color: COLORS.white || '#fff',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  couponErrorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    padding: 8,
+    backgroundColor: '#f8d7da',
+    borderRadius: 8,
+  },
+  couponErrorIcon: {
+    fontSize: 14,
+    marginRight: 6,
+  },
+  couponError: {
+    flex: 1,
+    fontSize: 12,
+    color: '#dc3545',
+  },
+  appliedCouponCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#d4edda',
+    borderWidth: 1,
+    borderColor: '#28a745',
+    borderRadius: 12,
+    padding: 12,
+  },
+  appliedCouponIconContainer: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#28a745',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  appliedCouponIcon: {
+    fontSize: 20,
+  },
+  appliedCouponInfo: {
+    flex: 1,
+  },
+  appliedCouponCode: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#28a745',
+    fontFamily: 'monospace',
+  },
+  appliedCouponDiscount: {
+    fontSize: 12,
+    color: '#28a745',
+    marginTop: 2,
+  },
+  removeCouponButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: '#fff',
+    borderRadius: 8,
+  },
+  removeCouponText: {
+    color: '#dc3545',
+    fontSize: 12,
+    fontWeight: '600',
+  },
   summary: {
     backgroundColor: COLORS.white || '#fff',
     marginHorizontal: 20,
@@ -732,6 +1152,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.black || '#000',
   },
+  discountValue: {
+    fontSize: 14,
+    color: '#28a745',
+    fontWeight: '600',
+  },
   divider: {
     height: 1,
     backgroundColor: '#e9ecef',
@@ -746,6 +1171,15 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     color: COLORS.primary || '#007aff',
+  },
+  savingsText: {
+    fontSize: 11,
+    color: '#28a745',
+    textAlign: 'center',
+    marginTop: 12,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#e9ecef',
   },
   submitButton: {
     margin: 20,
@@ -887,31 +1321,117 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#007aff',
   },
-  paymentButtons: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 20,
-  },
-  paymentButton: {
-    flex: 1,
-    paddingVertical: 12,
+  paymentSavings: {
+    marginTop: 12,
+    padding: 8,
+    backgroundColor: '#d4edda',
     borderRadius: 8,
     alignItems: 'center',
   },
+  paymentSavingsText: {
+    fontSize: 12,
+    color: '#28a745',
+    fontWeight: '600',
+  },
   cancelPaymentButton: {
+    marginTop: 16,
+    paddingVertical: 14,
     backgroundColor: '#f8f9fa',
     borderWidth: 1,
     borderColor: '#e9ecef',
+    borderRadius: 12,
+    alignItems: 'center',
   },
   cancelPaymentText: {
     color: '#6c757d',
     fontWeight: '600',
+    fontSize: 16,
   },
-  confirmPaymentButton: {
-    backgroundColor: '#007aff',
+  qrModalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    padding: 24,
+    width: '90%',
+    maxHeight: '85%',
   },
-  confirmPaymentText: {
+  qrModalTitle: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#212529',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  qrContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+    backgroundColor: '#f8f9fa',
+    borderRadius: 16,
+    marginBottom: 20,
+  },
+  qrImage: {
+    width: 250,
+    height: 250,
+  },
+  qrInstructions: {
+    marginBottom: 20,
+  },
+  qrInstructionTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#212529',
+    marginBottom: 12,
+  },
+  instructionItem: {
+    flexDirection: 'row',
+    marginBottom: 10,
+  },
+  instructionBullet: {
+    fontSize: 14,
+    color: '#007aff',
+    fontWeight: '600',
+    width: 25,
+  },
+  instructionText: {
+    flex: 1,
+    fontSize: 14,
+    color: '#495057',
+    lineHeight: 20,
+  },
+  saveQRContainer: {
+    backgroundColor: '#fff3cd',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 20,
+  },
+  saveQRText: {
+    fontSize: 12,
+    color: '#856404',
+    textAlign: 'center',
+  },
+  qrConfirmButton: {
+    backgroundColor: '#28a745',
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  qrConfirmButtonText: {
     color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  qrCancelButton: {
+    backgroundColor: '#f8f9fa',
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e9ecef',
+  },
+  qrCancelButtonText: {
+    color: '#6c757d',
+    fontSize: 16,
     fontWeight: '600',
   },
 });

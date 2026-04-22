@@ -1,17 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import { collection, doc, getDoc, getDocs, orderBy, query, setDoc, updateDoc } from 'firebase/firestore';
+import React, { useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  TouchableOpacity,
-  RefreshControl,
   Alert,
+  Modal,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View
 } from 'react-native';
-import { COLORS, SIZES } from '../constants/theme';
 import { db } from '../firebase';
-import { collection, query, getDocs, updateDoc, doc, orderBy } from 'firebase/firestore';
-import { router } from 'expo-router';
 
 interface Order {
   id: string;
@@ -30,8 +29,37 @@ interface Order {
   createdAt: string;
 }
 
+interface UserLoyalty {
+  userId: string;
+  userEmail: string;
+  totalOrders: number;
+  totalPoints: number;
+  currentMilestone: number;
+  milestonesReached: Milestone[];
+}
+
+interface Milestone {
+  level: number;
+  ordersRequired: number;
+  discountPercentage: number;
+  achievedAt: string;
+  couponCode: string;
+}
+
+// Static coupon codes for each milestone (NOT random)
+const STATIC_COUPONS = {
+  1: { code: "LAUND5", discount: 5, ordersRequired: 25 },
+  2: { code: "LAUND8", discount: 8, ordersRequired: 50 },
+  3: { code: "LAUND10", discount: 10, ordersRequired: 75 },
+  4: { code: "LAUND12", discount: 12, ordersRequired: 100 },
+  5: { code: "LAUND15", discount: 15, ordersRequired: 150 },
+  6: { code: "LAUND18", discount: 18, ordersRequired: 200 },
+  7: { code: "LAUND20", discount: 20, ordersRequired: 250 },
+};
+
 const AdminDashboard = () => {
   const [orders, setOrders] = useState<Order[]>([]);
+  const [usersLoyalty, setUsersLoyalty] = useState<UserLoyalty[]>([]);
   const [stats, setStats] = useState({
     totalOrders: 0,
     pendingOrders: 0,
@@ -44,14 +72,173 @@ const AdminDashboard = () => {
     todayWeight: 0,
     thisWeekRevenue: 0,
     thisWeekWeight: 0,
+    totalPointsAwarded: 0,
+    totalCouponsIssued: 0,
+    totalCouponsRedeemed: 0,
   });
   const [refreshing, setRefreshing] = useState(false);
   const [selectedTab, setSelectedTab] = useState('all');
   const [expandedOrder, setExpandedOrder] = useState<string | null>(null);
+  const [showLoyaltyModal, setShowLoyaltyModal] = useState(false);
+
+  // Milestone configuration with static coupon codes
+  const milestones = [
+    { level: 1, ordersRequired: 25, discount: 5, couponCode: "LAUND5" },
+    { level: 2, ordersRequired: 50, discount: 8, couponCode: "LAUND8" },
+    { level: 3, ordersRequired: 75, discount: 10, couponCode: "LAUND10" },
+    { level: 4, ordersRequired: 100, discount: 12, couponCode: "LAUND12" },
+    { level: 5, ordersRequired: 150, discount: 15, couponCode: "LAUND15" },
+    { level: 6, ordersRequired: 200, discount: 18, couponCode: "LAUND18" },
+    { level: 7, ordersRequired: 250, discount: 20, couponCode: "LAUND20" },
+  ];
 
   useEffect(() => {
     fetchOrders();
+    fetchLoyaltyData();
   }, []);
+
+  // REMOVED generateCouponCode function - no longer needed
+
+  const checkAndAwardMilestones = async (userId: string, userEmail: string, totalOrders: number) => {
+    const userLoyaltyRef = doc(db, 'userLoyalty', userId);
+    const userLoyaltyDoc = await getDoc(userLoyaltyRef);
+    const currentData = userLoyaltyDoc.data() as UserLoyalty;
+    const reachedMilestones: Milestone[] = [];
+
+    for (const milestone of milestones) {
+      const alreadyReached = currentData?.milestonesReached?.some(m => m.level === milestone.level);
+      
+      if (totalOrders >= milestone.ordersRequired && !alreadyReached) {
+        // Use STATIC coupon code, not random generated
+        const couponCode = milestone.couponCode;
+
+        reachedMilestones.push({
+          level: milestone.level,
+          ordersRequired: milestone.ordersRequired,
+          discountPercentage: milestone.discount,
+          achievedAt: new Date().toISOString(),
+          couponCode: couponCode,
+        });
+
+        // Alert admin about new milestone reached with static coupon
+        Alert.alert(
+          '🎉 Milestone Reached!',
+          `User ${userEmail} has reached ${milestone.ordersRequired} orders!\n\n` +
+          `🏆 Milestone ${milestone.level}: ${milestone.discount}% discount\n` +
+          `🎫 Coupon Code: ${couponCode}\n` +
+          `⚠️ One-time use per customer`,
+          [{ text: 'OK' }]
+        );
+      }
+    }
+
+    if (reachedMilestones.length > 0) {
+      await updateDoc(userLoyaltyRef, {
+        milestonesReached: [...(currentData?.milestonesReached || []), ...reachedMilestones],
+        currentMilestone: Math.max(...reachedMilestones.map(m => m.level), currentData?.currentMilestone || 0),
+      });
+    }
+  };
+
+  const updateOrderStatus = async (orderId: string, newStatus: string) => {
+    Alert.alert(
+      'Update Status',
+      `Mark this order as ${newStatus}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Confirm',
+          onPress: async () => {
+            try {
+              const orderRef = doc(db, 'orders', orderId);
+              const orderDoc = await getDoc(orderRef);
+              const orderData = orderDoc.data() as Order;
+
+              await updateDoc(orderRef, {
+                status: newStatus,
+                updatedAt: new Date().toISOString(),
+              });
+
+              // Award loyalty points only when order is completed
+              if (newStatus === 'completed' && orderData.status !== 'completed') {
+                await awardLoyaltyPoints(orderData.userId, orderData.userEmail, orderId);
+              }
+
+              await fetchOrders();
+              await fetchLoyaltyData();
+              Alert.alert('Success', `Order marked as ${newStatus}`);
+            } catch (error) {
+              Alert.alert('Error', 'Failed to update order');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const awardLoyaltyPoints = async (userId: string, userEmail: string, orderId: string) => {
+    const POINTS_PER_ORDER = 5;
+    const userLoyaltyRef = doc(db, 'userLoyalty', userId);
+    const userLoyaltyDoc = await getDoc(userLoyaltyRef);
+
+    if (userLoyaltyDoc.exists()) {
+      const currentData = userLoyaltyDoc.data() as UserLoyalty;
+      const newTotalPoints = currentData.totalPoints + POINTS_PER_ORDER;
+      const newTotalOrders = currentData.totalOrders + 1;
+
+      await updateDoc(userLoyaltyRef, {
+        totalPoints: newTotalPoints,
+        totalOrders: newTotalOrders,
+        lastOrderDate: new Date().toISOString(),
+      });
+
+      // Check for milestones
+      await checkAndAwardMilestones(userId, userEmail, newTotalOrders);
+    } else {
+      // Create new loyalty record
+      await setDoc(userLoyaltyRef, {
+        userId: userId,
+        userEmail: userEmail,
+        totalOrders: 1,
+        totalPoints: POINTS_PER_ORDER,
+        currentMilestone: 0,
+        milestonesReached: [],
+        createdAt: new Date().toISOString(),
+      });
+    }
+  };
+
+  const fetchLoyaltyData = async () => {
+    try {
+      const loyaltyQuery = query(collection(db, 'userLoyalty'), orderBy('totalPoints', 'desc'));
+      const loyaltySnapshot = await getDocs(loyaltyQuery);
+      const loyaltyList = loyaltySnapshot.docs.map(doc => ({
+        ...doc.data(),
+      })) as UserLoyalty[];
+      
+      setUsersLoyalty(loyaltyList);
+
+      // Calculate loyalty stats
+      const totalPoints = loyaltyList.reduce((sum, user) => sum + user.totalPoints, 0);
+      
+      // Count used coupons from usedCoupons collection
+      const usedCouponsQuery = query(collection(db, 'usedCoupons'));
+      const usedCouponsSnapshot = await getDocs(usedCouponsQuery);
+      const totalCouponsRedeemed = usedCouponsSnapshot.size;
+      
+      // Count total milestones reached (each milestone counts as a coupon issued)
+      const totalCouponsIssued = loyaltyList.reduce((sum, user) => sum + (user.milestonesReached?.length || 0), 0);
+      
+      setStats(prev => ({
+        ...prev,
+        totalPointsAwarded: totalPoints,
+        totalCouponsIssued: totalCouponsIssued,
+        totalCouponsRedeemed: totalCouponsRedeemed,
+      }));
+    } catch (error) {
+      console.error('Error fetching loyalty data:', error);
+    }
+  };
 
   const fetchOrders = async () => {
     try {
@@ -99,40 +286,19 @@ const AdminDashboard = () => {
         todayWeight: todayWeight,
         thisWeekRevenue: thisWeekRevenue,
         thisWeekWeight: thisWeekWeight,
+        totalPointsAwarded: stats.totalPointsAwarded,
+        totalCouponsIssued: stats.totalCouponsIssued,
+        totalCouponsRedeemed: stats.totalCouponsRedeemed,
       });
     } catch (error) {
       Alert.alert('Error', 'Failed to load orders');
     }
   };
 
-  const updateOrderStatus = async (orderId: string, newStatus: string) => {
-    Alert.alert(
-      'Update Status',
-      `Mark this order as ${newStatus}?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Confirm',
-          onPress: async () => {
-            try {
-              await updateDoc(doc(db, 'orders', orderId), {
-                status: newStatus,
-                updatedAt: new Date().toISOString(),
-              });
-              await fetchOrders();
-              Alert.alert('Success', `Order marked as ${newStatus}`);
-            } catch (error) {
-              Alert.alert('Error', 'Failed to update order');
-            }
-          },
-        },
-      ]
-    );
-  };
-
   const onRefresh = async () => {
     setRefreshing(true);
     await fetchOrders();
+    await fetchLoyaltyData();
     setRefreshing(false);
   };
 
@@ -177,6 +343,80 @@ const AdminDashboard = () => {
     }
   };
 
+  const LoyaltyModal = () => (
+    <Modal
+      visible={showLoyaltyModal}
+      animationType="slide"
+      transparent={true}
+      onRequestClose={() => setShowLoyaltyModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.modalContent}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>🎖️ Loyalty Program</Text>
+            <TouchableOpacity onPress={() => setShowLoyaltyModal(false)}>
+              <Text style={styles.modalClose}>✕</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={styles.modalBody}>
+            {/* Milestones Overview */}
+            <View style={styles.milestonesSection}>
+              <Text style={styles.modalSubtitle}>🏆 Milestone Rewards</Text>
+              <View style={styles.milestonesGrid}>
+                {milestones.map((milestone) => (
+                  <View key={milestone.level} style={styles.milestoneCard}>
+                    <Text style={styles.milestoneLevel}>Level {milestone.level}</Text>
+                    <Text style={styles.milestoneRequirement}>
+                      {milestone.ordersRequired} orders
+                    </Text>
+                    <View style={styles.milestoneDiscount}>
+                      <Text style={styles.milestoneDiscountText}>
+                        {milestone.discount}% OFF
+                      </Text>
+                    </View>
+                    <Text style={styles.milestoneCouponCode}>
+                      Code: {milestone.couponCode}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+
+            {/* User Rankings */}
+            <View style={styles.rankingsSection}>
+              <Text style={styles.modalSubtitle}>👥 Customer Rankings</Text>
+              {usersLoyalty.map((user, index) => (
+                <View key={user.userId} style={styles.rankingCard}>
+                  <View style={styles.rankingHeader}>
+                    <Text style={styles.rankingPosition}>#{index + 1}</Text>
+                    <Text style={styles.rankingEmail}>{user.userEmail}</Text>
+                  </View>
+                  <View style={styles.rankingStats}>
+                    <View style={styles.rankingStat}>
+                      <Text style={styles.rankingStatValue}>{user.totalOrders}</Text>
+                      <Text style={styles.rankingStatLabel}>Orders</Text>
+                    </View>
+                    <View style={styles.rankingStat}>
+                      <Text style={styles.rankingStatValue}>{user.totalPoints}</Text>
+                      <Text style={styles.rankingStatLabel}>Points</Text>
+                    </View>
+                    <View style={styles.rankingStat}>
+                      <Text style={styles.rankingStatValue}>
+                        {user.milestonesReached?.length || 0}
+                      </Text>
+                      <Text style={styles.rankingStatLabel}>Milestones</Text>
+                    </View>
+                  </View>
+                </View>
+              ))}
+            </View>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+
   return (
     <ScrollView 
       style={styles.container}
@@ -184,31 +424,30 @@ const AdminDashboard = () => {
     >
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>                    Dashboard</Text>
-        <View style={styles.placeholder} />
+        <Text style={styles.headerTitle}>Admin Dashboard</Text>
+        <TouchableOpacity 
+          style={styles.loyaltyButton}
+          onPress={() => setShowLoyaltyModal(true)}
+        >
+          <Text style={styles.loyaltyButtonText}>🎖️</Text>
+        </TouchableOpacity>
       </View>
 
       {/* Stats Section */}
       <View style={styles.statsSection}>
         <Text style={styles.sectionTitle}>Overview</Text>
         
-        {/* Main Stats Row */}
         <View style={styles.mainStatsRow}>
           <View style={styles.mainStatCard}>
             <Text style={styles.mainStatValue}>{stats.totalOrders}</Text>
             <Text style={styles.mainStatLabel}>Total Orders</Text>
-            <View style={styles.mainStatIcon}>
-              <Text style={styles.mainStatIconText}>📊</Text>
-            </View>
           </View>
         </View>
 
-        {/* Revenue & Weight Section */}
         <View style={styles.revenueSection}>
           <View style={styles.revenueCard}>
             <Text style={styles.revenueTitle}>Revenue</Text>
             <Text style={styles.revenueAmount}>{formatCurrency(stats.totalRevenue)}</Text>
-            
             <View style={styles.revenueBreakdown}>
               <View style={styles.breakdownItem}>
                 <Text style={styles.breakdownLabel}>Today</Text>
@@ -225,7 +464,6 @@ const AdminDashboard = () => {
           <View style={styles.weightCard}>
             <Text style={styles.revenueTitle}>Total Weight</Text>
             <Text style={styles.revenueAmount}>{formatWeight(stats.totalWeight)}</Text>
-            
             <View style={styles.revenueBreakdown}>
               <View style={styles.breakdownItem}>
                 <Text style={styles.breakdownLabel}>Today</Text>
@@ -240,28 +478,43 @@ const AdminDashboard = () => {
           </View>
         </View>
 
+        {/* Loyalty Stats */}
+        <View style={styles.loyaltyStatsSection}>
+          <Text style={styles.subSectionTitle}>🎯 Loyalty Program Stats</Text>
+          <View style={styles.loyaltyStatsGrid}>
+            <View style={styles.loyaltyStatCard}>
+              <Text style={styles.loyaltyStatValue}>{stats.totalPointsAwarded}</Text>
+              <Text style={styles.loyaltyStatLabel}>Points Awarded</Text>
+            </View>
+            <View style={styles.loyaltyStatCard}>
+              <Text style={styles.loyaltyStatValue}>{stats.totalCouponsIssued}</Text>
+              <Text style={styles.loyaltyStatLabel}>Coupons Earned</Text>
+            </View>
+            <View style={styles.loyaltyStatCard}>
+              <Text style={styles.loyaltyStatValue}>{stats.totalCouponsRedeemed}</Text>
+              <Text style={styles.loyaltyStatLabel}>Coupons Used</Text>
+            </View>
+          </View>
+        </View>
+
         {/* Status Stats Grid */}
         <Text style={styles.subSectionTitle}>Order Status</Text>
         <View style={styles.statusGrid}>
           <View style={[styles.statusCard, { backgroundColor: '#fff3cd' }]}>
             <Text style={styles.statusValue}>{stats.pendingOrders}</Text>
             <Text style={styles.statusLabel}>Pending</Text>
-            <View style={[styles.statusDot, { backgroundColor: '#ffc107' }]} />
           </View>
           <View style={[styles.statusCard, { backgroundColor: '#cce5ff' }]}>
             <Text style={styles.statusValue}>{stats.processingOrders}</Text>
             <Text style={styles.statusLabel}>Processing</Text>
-            <View style={[styles.statusDot, { backgroundColor: '#007aff' }]} />
           </View>
           <View style={[styles.statusCard, { backgroundColor: '#d4edda' }]}>
             <Text style={styles.statusValue}>{stats.completedOrders}</Text>
             <Text style={styles.statusLabel}>Completed</Text>
-            <View style={[styles.statusDot, { backgroundColor: '#28a745' }]} />
           </View>
           <View style={[styles.statusCard, { backgroundColor: '#f8d7da' }]}>
             <Text style={styles.statusValue}>{stats.cancelledOrders}</Text>
             <Text style={styles.statusLabel}>Cancelled</Text>
-            <View style={[styles.statusDot, { backgroundColor: '#dc3545' }]} />
           </View>
         </View>
       </View>
@@ -333,7 +586,6 @@ const AdminDashboard = () => {
                   </View>
                 </View>
 
-                {/* Expanded Content - Address and Notes */}
                 {expandedOrder === order.id && (
                   <View style={styles.expandedContent}>
                     <View style={styles.addressSection}>
@@ -390,6 +642,8 @@ const AdminDashboard = () => {
           ))
         )}
       </View>
+
+      <LoyaltyModal />
     </ScrollView>
   );
 };
@@ -410,20 +664,18 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#e9ecef',
   },
-  backButton: {
-    padding: 5,
-  },
-  backButtonText: {
-    fontSize: 28,
-    color: '#007aff',
-  },
   headerTitle: {
     fontSize: 20,
     fontWeight: 'bold',
     color: '#212529',
   },
-  placeholder: {
-    width: 40,
+  loyaltyButton: {
+    padding: 8,
+    backgroundColor: '#fff3cd',
+    borderRadius: 20,
+  },
+  loyaltyButtonText: {
+    fontSize: 24,
   },
   statsSection: {
     padding: 20,
@@ -453,7 +705,6 @@ const styles = StyleSheet.create({
     padding: 16,
     borderWidth: 1,
     borderColor: '#e9ecef',
-    position: 'relative',
   },
   mainStatValue: {
     fontSize: 32,
@@ -464,14 +715,6 @@ const styles = StyleSheet.create({
   mainStatLabel: {
     fontSize: 12,
     color: '#6c757d',
-  },
-  mainStatIcon: {
-    position: 'absolute',
-    top: 16,
-    right: 16,
-  },
-  mainStatIconText: {
-    fontSize: 24,
   },
   revenueSection: {
     flexDirection: 'row',
@@ -530,6 +773,33 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
   },
+  loyaltyStatsSection: {
+    marginBottom: 20,
+  },
+  loyaltyStatsGrid: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  loyaltyStatCard: {
+    flex: 1,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e9ecef',
+  },
+  loyaltyStatValue: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#007aff',
+    marginBottom: 4,
+  },
+  loyaltyStatLabel: {
+    fontSize: 11,
+    color: '#6c757d',
+    textAlign: 'center',
+  },
   statusGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -540,7 +810,6 @@ const styles = StyleSheet.create({
     minWidth: '47%',
     borderRadius: 12,
     padding: 16,
-    position: 'relative',
   },
   statusValue: {
     fontSize: 28,
@@ -551,14 +820,6 @@ const styles = StyleSheet.create({
   statusLabel: {
     fontSize: 14,
     color: '#6c757d',
-  },
-  statusDot: {
-    position: 'absolute',
-    top: 16,
-    right: 16,
-    width: 8,
-    height: 8,
-    borderRadius: 4,
   },
   tabsSection: {
     paddingHorizontal: 20,
@@ -735,6 +996,168 @@ const styles = StyleSheet.create({
   actionBtnText: {
     color: '#fff',
     fontSize: 11,
+    fontWeight: '600',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    width: '90%',
+    maxHeight: '80%',
+    overflow: 'hidden',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e9ecef',
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#212529',
+  },
+  modalClose: {
+    fontSize: 24,
+    color: '#6c757d',
+  },
+  modalBody: {
+    padding: 20,
+  },
+  modalSubtitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#212529',
+    marginBottom: 16,
+  },
+  milestonesSection: {
+    marginBottom: 24,
+  },
+  milestonesGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  milestoneCard: {
+    flex: 1,
+    minWidth: '30%',
+    backgroundColor: '#f8f9fa',
+    borderRadius: 12,
+    padding: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e9ecef',
+  },
+  milestoneLevel: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#007aff',
+    marginBottom: 4,
+  },
+  milestoneRequirement: {
+    fontSize: 12,
+    color: '#6c757d',
+    marginBottom: 8,
+  },
+  milestoneDiscount: {
+    backgroundColor: '#28a745',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  milestoneDiscountText: {
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  milestoneCouponCode: {
+    fontSize: 10,
+    color: '#007aff',
+    marginTop: 6,
+    fontFamily: 'monospace',
+  },
+  rankingsSection: {
+    marginBottom: 24,
+  },
+  rankingCard: {
+    backgroundColor: '#f8f9fa',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#e9ecef',
+  },
+  rankingHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  rankingPosition: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#007aff',
+    marginRight: 12,
+  },
+  rankingEmail: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#212529',
+    flex: 1,
+  },
+  rankingStats: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginBottom: 12,
+  },
+  rankingStat: {
+    alignItems: 'center',
+  },
+  rankingStatValue: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#212529',
+  },
+  rankingStatLabel: {
+    fontSize: 11,
+    color: '#6c757d',
+  },
+  userCoupons: {
+    borderTopWidth: 1,
+    borderTopColor: '#e9ecef',
+    paddingTop: 12,
+    marginTop: 8,
+  },
+  userCouponsTitle: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#007aff',
+    marginBottom: 8,
+  },
+  userCouponItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    padding: 8,
+    borderRadius: 8,
+    marginBottom: 6,
+  },
+  userCouponCode: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#212529',
+    fontFamily: 'monospace',
+  },
+  userCouponDiscount: {
+    fontSize: 11,
+    color: '#28a745',
     fontWeight: '600',
   },
 });
